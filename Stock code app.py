@@ -8,8 +8,8 @@ import os
 # 1️⃣ APP CONFIGURATION
 # ================================
 st.set_page_config(page_title="Pro Market Scanner", page_icon="📊", layout="wide")
-st.title("🚀 NSE/BSE Dual Screener (Pro View)")
-st.markdown("Scans for **Gainers** 🟢 and **Losers** 🔴 with full technical data.")
+st.title("🚀 NSE/BSE Market Screener")
+st.markdown("Exact data view with **History**, **MA**, and **RSI**.")
 
 # ================================
 # 2️⃣ SIDEBAR SETTINGS
@@ -95,7 +95,7 @@ if run_scan:
                 
                 # --- CALCULATIONS ---
                 df['Return'] = df['Close'].pct_change() * 100
-                df['MA20'] = df['Close'].rolling(window=ma_window).mean()
+                df['MA'] = df['Close'].rolling(window=ma_window).mean()
                 
                 # RSI Calculation
                 delta = df['Close'].diff()
@@ -105,8 +105,10 @@ if run_scan:
                 df['RSI'] = 100 - (100 / (1 + rs))
 
                 today = df.iloc[-1]
+                prev1 = df.iloc[-2]
+                prev2 = df.iloc[-3]
                 
-                # Filter: Must be Gainer OR Loser
+                # Filter: Gainer OR Loser
                 is_gainer = today['Return'] >= move_pct
                 is_loser = today['Return'] <= -move_pct
                 
@@ -117,32 +119,30 @@ if run_scan:
                 if name in seen: continue
                 seen.add(name)
                 
-                # Trend (Previous 2 days)
-                prev1 = df.iloc[-2]
-                prev2 = df.iloc[-3]
-                
-                if is_gainer:
-                    trend = "🟢 UP" if (prev1['Return'] > 0 and prev2['Return'] > 0) else "Mixed"
-                else:
-                    trend = "🔴 DOWN" if (prev1['Return'] < 0 and prev2['Return'] < 0) else "Mixed"
-                
-                # Volume Signal (REMOVED FIRE EMOTE)
+                # Volume Logic
                 avg_vol = df['Volume'].iloc[-4:-1].mean()
-                vol_signal = "HIGH" if (avg_vol > 0 and today['Volume'] > avg_vol) else "Normal"
+                vol_txt = "Above Avg" if (avg_vol > 0 and today['Volume'] > avg_vol) else "Normal"
                 
-                # 52-Week High Distance
+                # 52W High Distance
                 high_52 = df['Close'].max()
                 dist_52 = ((today['Close'] - high_52) / high_52) * 100
+                
+                # Above MA Check
+                above_ma_check = "✅" if today['Close'] > today['MA'] else "❌"
 
-                # Data Row
+                # --- DATA ROW (Exact Match to Your Request) ---
                 row = {
                     "Symbol": name,
                     "Price": round(today['Close'], 2),
-                    "Change %": round(today['Return'], 2),
-                    "Trend": trend,
-                    "RSI": round(today['RSI'], 1),
-                    "Volume": vol_signal,
-                    "52W Dist": f"{round(dist_52, 1)}%",
+                    "Today %": round(today['Return'], 2),
+                    "Prev Day %": round(prev1['Return'], 2),
+                    "Prev-2 Day %": round(prev2['Return'], 2),
+                    "MA": round(today['MA'], 2),
+                    "Above MA": above_ma_check,
+                    "RSI": round(today['RSI'], 2),
+                    "Dist 52W High": f"{round(dist_52, 1)}%",
+                    "Volume": int(today['Volume']),
+                    "Volume Signal": vol_txt,
                     "Exchange": "NSE" if ".NS" in ticker else "BSE"
                 }
                 
@@ -160,29 +160,36 @@ if run_scan:
         
         tab1, tab2 = st.tabs([f"🟢 Gainers ({len(gainers)})", f"🔴 Losers ({len(losers)})"])
         
-        # Helper to display and download
         def show_tab(data_list, filename):
             if data_list:
                 df_res = pd.DataFrame(data_list)
                 
-                # Sort Order: Gainers (Desc), Losers (Asc)
+                # Sort Logic
                 sort_asc = True if "loser" in filename else False
-                df_res = df_res.sort_values(by="Change %", ascending=sort_asc)
+                df_res = df_res.sort_values(by="Today %", ascending=sort_asc)
                 
-                # Formatting
+                # Format Columns specifically for Streamlit Table
+                column_config = {
+                    "Price": st.column_config.NumberColumn(format="₹%.2f"),
+                    "Today %": st.column_config.NumberColumn(format="%.2f%%"),
+                    "Prev Day %": st.column_config.NumberColumn(format="%.2f%%"),
+                    "Prev-2 Day %": st.column_config.NumberColumn(format="%.2f%%"),
+                    "MA": st.column_config.NumberColumn(format="%.2f"),
+                    "RSI": st.column_config.NumberColumn(format="%.1f"),
+                }
+                
                 st.dataframe(
-                    df_res.style.applymap(
-                        lambda x: 'color: green' if x == '🟢 UP' else ('color: red' if x == '🔴 DOWN' else ''), 
-                        subset=['Trend']
-                    ).format({"Price": "₹{:.2f}", "Change %": "{:.2f}%"}),
-                    use_container_width=True,
-                    height=500
+                    df_res, 
+                    use_container_width=True, 
+                    height=600, 
+                    column_config=column_config
                 )
                 
+                # Download Button
                 csv = df_res.to_csv(index=False).encode('utf-8')
                 st.download_button(f"📥 Download CSV", csv, filename, "text/csv")
             else:
-                st.info("No stocks found in this category.")
+                st.info("No stocks found.")
 
         with tab1:
             show_tab(gainers, "gainers.csv")
