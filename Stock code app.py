@@ -1,3 +1,4 @@
+import streamlit as st
 import pandas as pd
 import yfinance as yf
 import requests
@@ -7,45 +8,43 @@ import os
 from datetime import datetime
 
 # ================================
-# 1. CONFIGURATION
+# 1. APP CONFIGURATION
 # ================================
-MOVE_PCT = 5.0      # Trigger %
-MA_WINDOW = 20      # Moving Average Period
-CHUNK_SIZE = 300    # Download in batches
+st.set_page_config(page_title="Pro Market Scanner", layout="wide")
+st.title("NSE/BSE Market Screener")
+st.markdown("Exact data view with History, MA, RSI, and News Links.")
 
 # ================================
-# 2. SOURCE: NSE (EQUITY_L.csv)
+# 2. SIDEBAR SETTINGS
 # ================================
-def get_stock_list():
-    print("⏳ Fetching Stock List from NSE (EQUITY_L.csv)...")
-    url = "https://archives.nseindia.com/content/equities/EQUITY_L.csv"
+with st.sidebar:
+    st.header("Settings")
+    move_pct = st.number_input("Trigger % (e.g., 5 for +/- 5%)", value=5.0, step=0.5)
+    ma_window = st.number_input("MA Period", value=20, step=1)
     
+    st.markdown("---")
+    if st.button("START SCAN", type="primary"):
+        run_scan = True
+    else:
+        run_scan = False
+
+# ================================
+# 3. FUNCTIONS
+# ================================
+@st.cache_data(ttl=3600)
+def get_stock_list():
+    url = "https://archives.nseindia.com/content/equities/EQUITY_L.csv"
     try:
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        s = requests.get(url, headers=headers).content
-        df = pd.read_csv(io.StringIO(s.decode('utf-8')))
+        # NSE requires User-Agent
+        df = pd.read_csv(url, storage_options={'User-Agent': 'Mozilla/5.0'})
         df.columns = df.columns.str.strip()
         base = df['SYMBOL'].unique().tolist()
-        
-        # Create NSE + BSE Tickers
-        tickers = [s + ".NS" for s in base] + [s + ".BO" for s in base]
-        
-        print(f"   ✅ Found {len(base)} Base Symbols.")
-        print(f"   🚀 Total Tickers to Scan: {len(tickers)}")
-        return tickers
-    except Exception as e:
-        print(f"   ❌ Error fetching NSE list: {e}")
+        return [s + ".NS" for s in base] + [s + ".BO" for s in base]
+    except Exception:
         return []
 
-# ================================
-# 3. SCANNER ENGINE
-# ================================
-def run_scan():
-    tickers = get_stock_list()
-    if not tickers: return
-
-    print("\n⏳ Downloading Market Data (History, MA, RSI)...")
-    
+def download_data(tickers):
+    # Suppress yfinance print noise
     class SuppressPrints:
         def __enter__(self):
             self._original_stderr = sys.stderr
@@ -55,130 +54,169 @@ def run_scan():
             sys.stderr = self._original_stderr
 
     all_dfs = []
+    chunk_size = 300
     
-    for i in range(0, len(tickers), CHUNK_SIZE):
-        chunk = tickers[i:i+CHUNK_SIZE]
-        print(f"   Processing Batch {i//CHUNK_SIZE + 1} / {len(tickers)//CHUNK_SIZE + 1}...", end='\r')
-        
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    for i in range(0, len(tickers), chunk_size):
+        chunk = tickers[i:i+chunk_size]
         try:
             with SuppressPrints():
-                # auto_adjust=False ensures EXACT Close price
+                # auto_adjust=False for EXACT Close prices
                 batch = yf.download(chunk, period="3mo", interval="1d", group_by='ticker', auto_adjust=False, threads=True, progress=False)
             if not batch.empty:
                 all_dfs.append(batch)
+            
+            # Update Progress
+            progress = min((i + chunk_size) / len(tickers), 1.0)
+            progress_bar.progress(progress)
+            status_text.text(f"Scanning batch {i//chunk_size + 1}...")
         except: continue
-
-    print("\n✅ Download Complete. Calculating Metrics...")
+            
+    progress_bar.empty()
+    status_text.empty()
     
-    if not all_dfs: 
-        print("❌ No data downloaded.")
-        return
+    if all_dfs: return pd.concat(all_dfs, axis=1)
+    return None
+
+# ================================
+# 4. MAIN LOGIC
+# ================================
+if run_scan:
+    tickers = get_stock_list()
+    st.success(f"Scanning {len(tickers)} stocks...")
+    
+    data = download_data(tickers)
+    
+    if data is not None:
+        gainers = []
+        losers = []
+        seen = set()
         
-    data = pd.concat(all_dfs, axis=1)
-    
-    gainers = []
-    losers = []
-    seen = set()
-
-    for ticker in tickers:
-        try:
-            # Handle MultiIndex
-            if isinstance(data.columns, pd.MultiIndex):
+        for ticker in tickers:
+            try:
+                # Handle MultiIndex
                 if ticker not in data.columns.levels[0]: continue
                 df = data[ticker].copy()
-            else: continue
-
-            df.dropna(subset=['Close'], inplace=True)
-            if len(df) < 25: continue 
-
-            # --- CALCULATIONS ---
-            df['Return'] = df['Close'].pct_change() * 100
-            df['MA'] = df['Close'].rolling(window=MA_WINDOW).mean()
-
-            # RSI
-            delta = df['Close'].diff()
-            gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-            loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-            rs = gain / loss
-            df['RSI'] = 100 - (100 / (1 + rs))
-
-            today = df.iloc[-1]
-            prev1 = df.iloc[-2]
-            prev2 = df.iloc[-3]
-            
-            # --- FILTER ---
-            is_gainer = today['Return'] >= MOVE_PCT
-            is_loser = today['Return'] <= -MOVE_PCT
-            
-            if not (is_gainer or is_loser): continue
-
-            # Deduplicate
-            name = ticker.replace(".NS", "").replace(".BO", "")
-            if name in seen: continue
-            seen.add(name)
-
-            # Volume
-            avg_vol = df['Volume'].iloc[-4:-1].mean()
-            vol_txt = "Above Avg" if (avg_vol > 0 and today['Volume'] > avg_vol) else "Normal"
-            
-            high_52 = df['Close'].max()
-            dist_52 = ((today['Close'] - high_52) / high_52) * 100
-            above_ma_check = "Yes" if today['Close'] > today['MA'] else "No"
-            
-            # News Link
-            news_link = f"https://www.google.com/search?q={name}+share+news&tbm=nws"
-            
-            row = {
-                "Symbol": name,
-                "Price": round(today['Close'], 2),
-                "Today %": round(today['Return'], 2),
-                "Prev Day %": round(prev1['Return'], 2),
-                "Prev-2 Day %": round(prev2['Return'], 2),
-                "MA": round(today['MA'], 2),
-                "Above MA": above_ma_check,
-                "RSI": round(today['RSI'], 2),
-                "Dist 52W High": f"{round(dist_52, 1)}%",
-                "Volume": int(today['Volume']),
-                "Volume Signal": vol_txt,
-                "News Link": news_link,
-                "Exchange": "NSE" if ".NS" in ticker else "BSE"
-            }
-
-            if is_gainer: gainers.append(row)
-            elif is_loser: losers.append(row)
-
-        except: continue
-
-    # ================================
-    # SAVE OUTPUT (SINGLE FILE, TWO TABS)
-    # ================================
-    print("\n" + "="*40)
-    print(f"📊 REPORT GENERATED")
-    print(f"🟢 Gainers found: {len(gainers)}")
-    print(f"🔴 Losers found: {len(losers)}")
-    print("="*40)
-
-    current_date_str = datetime.now().strftime("%b %d")
-    final_filename = f"{current_date_str} PD's Data.xlsx"
-    
-    # We use ExcelWriter to put multiple sheets in one file
-    if gainers or losers:
-        with pd.ExcelWriter(final_filename, engine='xlsxwriter') as writer:
-            
-            if gainers:
-                df_gain = pd.DataFrame(gainers).sort_values(by="Today %", ascending=False)
-                df_gain.to_excel(writer, sheet_name='Gainers', index=False)
-                print("   Top 3 Gainers:")
-                display(df_gain[['Symbol', 'Price', 'Today %', 'News Link']].head(3))
-            
-            if losers:
-                df_loss = pd.DataFrame(losers).sort_values(by="Today %", ascending=True)
-                df_loss.to_excel(writer, sheet_name='Losers', index=False)
                 
-        print(f"\n✅ Successfully Saved: {final_filename}")
-        print("   (Open the file and check the bottom tabs for Gainers/Losers)")
-    else:
-        print("ℹ️ No stocks found matching criteria.")
+                df.dropna(subset=['Close'], inplace=True)
+                if len(df) < 25: continue
+                
+                # --- CALCULATIONS ---
+                df['Return'] = df['Close'].pct_change() * 100
+                df['MA'] = df['Close'].rolling(window=ma_window).mean()
+                
+                # RSI Calculation
+                delta = df['Close'].diff()
+                gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+                loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+                rs = gain / loss
+                df['RSI'] = 100 - (100 / (1 + rs))
 
-if __name__ == "__main__":
-    run_scan()
+                today = df.iloc[-1]
+                prev1 = df.iloc[-2]
+                prev2 = df.iloc[-3]
+                
+                # Filter: Gainer OR Loser
+                is_gainer = today['Return'] >= move_pct
+                is_loser = today['Return'] <= -move_pct
+                
+                if not (is_gainer or is_loser): continue
+
+                # Deduplicate
+                name = ticker.replace(".NS", "").replace(".BO", "")
+                if name in seen: continue
+                seen.add(name)
+                
+                # Volume Logic
+                avg_vol = df['Volume'].iloc[-4:-1].mean()
+                vol_txt = "Above Avg" if (avg_vol > 0 and today['Volume'] > avg_vol) else "Normal"
+                
+                # 52W High Distance
+                high_52 = df['Close'].max()
+                dist_52 = ((today['Close'] - high_52) / high_52) * 100
+                
+                # Above MA Check
+                above_ma_check = "Yes" if today['Close'] > today['MA'] else "No"
+                
+                # News Link
+                news_link = f"https://www.google.com/search?q={name}+share+news&tbm=nws"
+
+                # --- DATA ROW ---
+                row = {
+                    "Symbol": name,
+                    "Price": round(today['Close'], 2),
+                    "Today %": round(today['Return'], 2),
+                    "Prev Day %": round(prev1['Return'], 2),
+                    "Prev-2 Day %": round(prev2['Return'], 2),
+                    "MA": round(today['MA'], 2),
+                    "Above MA": above_ma_check,
+                    "RSI": round(today['RSI'], 2),
+                    "Dist 52W High": f"{round(dist_52, 1)}%",
+                    "Volume": int(today['Volume']),
+                    "Volume Signal": vol_txt,
+                    "News Link": news_link,
+                    "Exchange": "NSE" if ".NS" in ticker else "BSE"
+                }
+                
+                if is_gainer:
+                    gainers.append(row)
+                elif is_loser:
+                    losers.append(row)
+                    
+            except: continue
+        
+        # ================================
+        # 5. DISPLAY & EXPORT RESULTS
+        # ================================
+        st.success("Scan Complete!")
+        
+        tab1, tab2 = st.tabs([f"Gainers ({len(gainers)})", f"Losers ({len(losers)})"])
+        
+        # Helper to display dataframe nicely
+        def display_tab(data_list, sort_asc):
+            if data_list:
+                df_res = pd.DataFrame(data_list)
+                df_res = df_res.sort_values(by="Today %", ascending=sort_asc)
+                
+                st.dataframe(
+                    df_res, 
+                    use_container_width=True, 
+                    height=500,
+                    column_config={
+                        "News Link": st.column_config.LinkColumn("News"), # Clickable Link
+                        "Price": st.column_config.NumberColumn(format="₹%.2f"),
+                        "Today %": st.column_config.NumberColumn(format="%.2f%%")
+                    }
+                )
+                return df_res
+            else:
+                st.info("No stocks found.")
+                return pd.DataFrame()
+
+        with tab1:
+            df_gainers = display_tab(gainers, False) # Descending for Gainers
+            
+        with tab2:
+            df_losers = display_tab(losers, True)  # Ascending for Losers
+            
+        # --- EXCEL EXPORT (Single File, Two Sheets) ---
+        if not df_gainers.empty or not df_losers.empty:
+            buffer = io.BytesIO()
+            with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
+                if not df_gainers.empty:
+                    df_gainers.to_excel(writer, sheet_name='Gainers', index=False)
+                if not df_losers.empty:
+                    df_losers.to_excel(writer, sheet_name='Losers', index=False)
+            
+            # Prepare file for download
+            current_date_str = datetime.now().strftime("%b %d")
+            file_name = f"{current_date_str} PD's Data.xlsx"
+            
+            st.download_button(
+                label=f"📥 Download Excel Report",
+                data=buffer.getvalue(),
+                file_name=file_name,
+                mime="application/vnd.ms-excel"
+            )
